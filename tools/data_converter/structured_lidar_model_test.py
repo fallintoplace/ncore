@@ -15,8 +15,11 @@
 
 import unittest
 
+from typing import Literal, cast
+
 import numpy as np
 
+from ncore.impl.data import util as data_util
 from tools.data_converter.structured_lidar_model import (
     HDL32E_ELEVATIONS_RAD,
     HDL32E_FIRING_PAIR_INTERVAL_US,
@@ -25,12 +28,15 @@ from tools.data_converter.structured_lidar_model import (
     HDL32E_SCAN_DURATION_US,
     AlignedFrameData,
     ColumnAlignment,
+    _smooth_sparse_correction,
     assign_model_columns,
     compute_column_alignment,
     compute_frame_timestamps,
     compute_intra_column_firing_offsets,
     compute_model_consistency,
+    derive_model_from_decompensated,
     derive_nominal_hdl32e,
+    enforce_spinning_monotonic,
     extract_column_azimuths,
     optimize_model,
     upsample_model,
@@ -296,6 +302,359 @@ class TestStructuredLidarModel(unittest.TestCase):
         self.assertLess(opt_residual, initial_residual)
         # Should be near zero after 1 iteration with clean data
         self.assertLess(opt_residual, 1e-5)
+
+    def test_optimize_model_sparse_columns_global_offset(self) -> None:
+        """Sparse observations + a global phase offset must not tear the ramp.
+
+        Regression for the scene-0103/0007 failure: a high-resolution model has
+        far more columns than observed per frame, and the data carries a roughly
+        constant phase offset (~pi for some scenes) relative to the model. The
+        naive per-column update only shifted observed columns, leaving the
+        unobserved majority behind -- exploding the azimuth span past 2*pi and
+        producing a model that no longer reconstructs the point cloud. The
+        global/local split must keep the ramp monotonic and consistent.
+        """
+        model = self.model
+        n_obs_cols = model.n_columns // 4  # only a quarter of columns observed
+
+        # Observe a sparse, evenly-spaced subset of columns (>=3 points each),
+        # using only the reference row to keep the example small.
+        observed = np.arange(0, model.n_columns, 4, dtype=np.int64)[:n_obs_cols]
+        ref_row = model.n_rows // 2
+        reps = 3
+        model_cols = np.repeat(observed, reps)
+        model_rows = np.full(model_cols.shape, ref_row, dtype=np.int64)
+
+        # True azimuths = model azimuths + a large global phase offset.
+        global_offset = 3.0  # ~pi, the scene-0103 case
+        true_azimuths = np.arctan2(
+            np.sin(model.column_azimuths_rad[model_cols].astype(np.float64) + global_offset),
+            np.cos(model.column_azimuths_rad[model_cols].astype(np.float64) + global_offset),
+        )
+        distances = np.full(model_cols.shape, 30.0, dtype=np.float64)
+
+        optimized = optimize_model(
+            model,
+            frame_azimuths=[true_azimuths],
+            frame_model_cols=[model_cols],
+            frame_model_rows=[model_rows],
+            frame_distances=[distances],
+            min_range_m=10.0,
+            n_iterations=1,
+        )
+
+        # The result must still be a single, strictly-monotonic revolution.
+        col_az = optimized.column_azimuths_rad
+        rel = data_util.relative_angle(col_az[0], col_az, "cw")
+        self.assertTrue(np.all(np.diff(rel.relative_angle_rad) > 0))
+        span = float(col_az.astype(np.float64).max() - col_az.astype(np.float64).min())
+        self.assertLess(span, 2 * np.pi)
+
+        # The global offset must be absorbed: residual on observed columns small.
+        pred = optimized.column_azimuths_rad[model_cols].astype(np.float64)
+        resid = np.abs(np.arctan2(np.sin(true_azimuths - pred), np.cos(true_azimuths - pred)))
+        self.assertLess(resid.mean(), 0.05)
+
+    def test_optimize_model_noisy_correction_stays_monotonic(self) -> None:
+        """Per-column correction noise must not reorder columns.
+
+        Regression for the upsampled-model inversions: the per-column median
+        residual carries high-frequency noise from uneven point-to-column
+        assignment. Without smoothing, that noise exceeds the column spacing for
+        a fraction of columns and swaps them, so the azimuth ramp is no longer
+        monotonic and the model constructor rejects it. Smoothing the correction
+        must keep the output strictly monotonic.
+        """
+        # Upsample so the column spacing is small relative to the per-column
+        # noise (this is where the problem appears in real data).
+        model = upsample_model(self.model, 4)
+        n_cols = model.n_columns
+        ref_row = model.n_rows // 2
+
+        rng = np.random.default_rng(0)
+        # Observe most columns, a few times each, with per-observation azimuth
+        # noise an order of magnitude larger than the column spacing.
+        observed = np.arange(0, n_cols, dtype=np.int64)
+        reps = 3
+        model_cols = np.repeat(observed, reps)
+        model_rows = np.full(model_cols.shape, ref_row, dtype=np.int64)
+        column_spacing = 2 * np.pi / n_cols
+        noise = rng.normal(0.0, 5.0 * column_spacing, size=model_cols.shape)
+        true_azimuths = model.column_azimuths_rad[model_cols].astype(np.float64) + noise
+        distances = np.full(model_cols.shape, 30.0, dtype=np.float64)
+
+        optimized = optimize_model(
+            model,
+            frame_azimuths=[true_azimuths],
+            frame_model_cols=[model_cols],
+            frame_model_rows=[model_rows],
+            frame_distances=[distances],
+            min_range_m=10.0,
+            n_iterations=1,
+        )
+
+        col_az = optimized.column_azimuths_rad
+        rel = data_util.relative_angle(col_az[0], col_az, "cw")
+        self.assertTrue(
+            np.all(np.diff(rel.relative_angle_rad) > 0),
+            "optimized azimuths must be strictly monotonic despite correction noise",
+        )
+
+    # --- _smooth_sparse_correction tests ---------------------------------------
+
+    def test_smooth_sparse_correction_interpolates_and_denoises(self) -> None:
+        """Sparse, spiky correction becomes a smooth dense field."""
+        n = 200
+        cols = np.arange(n)
+        # Smooth underlying trend.
+        trend = 0.01 * np.sin(2 * np.pi * cols / n)
+        # Only every 3rd column observed; observed values carry spiky noise.
+        valid = (cols % 3) == 0
+        rng = np.random.default_rng(1)
+        values = np.zeros(n, dtype=np.float64)
+        values[valid] = trend[valid] + rng.normal(0.0, 0.02, size=int(valid.sum()))
+
+        smoothed = _smooth_sparse_correction(values, valid)
+
+        # Dense (defined everywhere) and adjacent variation strongly reduced.
+        self.assertEqual(smoothed.shape, (n,))
+        raw_adj = np.abs(np.diff(values[valid]))
+        smooth_adj = np.abs(np.diff(smoothed))
+        self.assertLess(smooth_adj.max(), raw_adj.max())
+        # Tracks the underlying trend within the noise level.
+        self.assertLess(float(np.abs(smoothed - trend).mean()), 0.02)
+
+    def test_smooth_sparse_correction_empty_valid_is_identity(self) -> None:
+        """With no observed columns the correction is returned unchanged."""
+        values = np.zeros(16, dtype=np.float64)
+        valid = np.zeros(16, dtype=bool)
+        out = _smooth_sparse_correction(values, valid)
+        np.testing.assert_array_equal(out, values)
+
+    # --- enforce_spinning_monotonic tests --------------------------------------
+
+    def test_enforce_spinning_monotonic_repairs_equal_pair(self) -> None:
+        """Adjacent equal azimuths are nudged apart to strictly decreasing (cw)."""
+        n = 1085
+        az = -np.arange(n, dtype=np.float64) * (2 * np.pi / n)
+        # Force an exactly-degenerate adjacent pair.
+        az[500] = az[499]
+
+        repaired = enforce_spinning_monotonic(az, n, "cw")
+
+        # The helper returns float32 (the dtype the model stores).
+        self.assertEqual(repaired.dtype, np.float32)
+        diffs = np.diff(repaired)
+        self.assertTrue(np.all(diffs < 0), "must be strictly decreasing")
+
+    def test_enforce_spinning_monotonic_repairs_local_inversion(self) -> None:
+        """A small local inversion is repaired without flipping global order."""
+        n = 1085
+        az = -np.arange(n, dtype=np.float64) * (2 * np.pi / n)
+        # Swap two neighbours to create a tiny inversion.
+        az[300], az[301] = az[301], az[300]
+
+        repaired = enforce_spinning_monotonic(az, n, "cw")
+
+        diffs = np.diff(repaired)
+        self.assertTrue(np.all(diffs < 0))
+
+    def test_enforce_spinning_monotonic_survives_float32_cast(self) -> None:
+        """The float32 result passes the ncore strict-monotonicity check (cw)."""
+        n = 1085
+        az = -np.arange(n, dtype=np.float64) * (2 * np.pi / n)
+        az[500] = az[499]
+
+        repaired32 = enforce_spinning_monotonic(az, n, "cw")
+        self.assertEqual(repaired32.dtype, np.float32)
+
+        rel = data_util.relative_angle(repaired32[0], repaired32, "cw")
+        self.assertTrue(np.all(np.diff(rel.relative_angle_rad) > 0))
+
+    def test_enforce_spinning_monotonic_reference_near_pi_boundary(self) -> None:
+        """A spin whose reference column sits near -pi still passes the check.
+
+        Regression for the empirical scene-1077 crash. The underlying defect was
+        in util.relative_angle (mixed float32/float64 `% 2pi` reduction); this
+        test guards the end-to-end behaviour: a strictly-decreasing CW sweep
+        starting just above -pi must yield strictly-increasing relative angles
+        and not wrap.
+        """
+        n = 4340
+        # Decreasing sweep whose first element is just above -pi.
+        az = -np.pi + 1e-3 - np.arange(n, dtype=np.float64) * ((2 * np.pi - 2e-3) / n)
+
+        repaired = enforce_spinning_monotonic(az, n, "cw")
+
+        rel = data_util.relative_angle(repaired[0], repaired, "cw")
+        self.assertEqual(float(rel.relative_angle_rad[0]), 0.0)
+        self.assertTrue(np.all(np.diff(rel.relative_angle_rad) > 0))
+        self.assertTrue(np.all(~rel.wrap_around_flag))
+
+    def test_enforce_spinning_monotonic_keeps_span_below_2pi(self) -> None:
+        """Repairing the real-world handful of inversions keeps span below 2*pi.
+
+        A near-full-revolution sweep (as the optimizer produces for a 4x model)
+        with a scattering of small adjacent inversions must still come out
+        strictly monotonic and strictly under one revolution.
+        """
+        n = 4340
+        # Uniform near-full-revolution sweep, then inject a handful of small
+        # local inversions like the per-column median corrections produce.
+        az = -np.arange(n, dtype=np.float64) * ((2 * np.pi - 1e-3) / n)
+        for i in (37, 311, 1024, 2570, 3999):
+            az[i], az[i + 1] = az[i + 1], az[i]
+
+        repaired32 = enforce_spinning_monotonic(az, n, "cw")
+
+        span = float(repaired32[0]) - float(repaired32[-1])
+        self.assertLess(span, 2 * np.pi, "span must stay below one revolution")
+        self.assertTrue(np.all(np.diff(repaired32) < 0), "strictly decreasing in float32")
+        rel = data_util.relative_angle(repaired32[0], repaired32, "cw")
+        self.assertTrue(np.all(np.diff(rel.relative_angle_rad) > 0))
+
+    def test_enforce_spinning_monotonic_rejects_more_than_one_revolution(self) -> None:
+        """Input covering more than a full revolution is rejected, not reshaped.
+
+        A genuine spinning sweep covers slightly less than 2*pi. An estimate that
+        sweeps past a full revolution indicates an upstream estimation bug, so the
+        helper raises rather than silently compressing it into a plausible-looking
+        but meaningless model.
+        """
+        n = 1085
+        # A monotonic sweep decreasing by 2.5*pi total -- more than one revolution.
+        az = -np.linspace(0.0, 2.5 * np.pi, n)
+
+        with self.assertRaises(ValueError):
+            enforce_spinning_monotonic(az, n, "cw")
+
+    def test_enforce_spinning_monotonic_ccw_repairs_to_increasing(self) -> None:
+        """For CCW rotation the repaired azimuths are strictly increasing."""
+        n = 1085
+        # Increasing CCW sweep with a degenerate pair and a local inversion.
+        az = np.arange(n, dtype=np.float64) * (2 * np.pi / n)
+        az[500] = az[499]
+        az[300], az[301] = az[301], az[300]
+
+        repaired = enforce_spinning_monotonic(az, n, "ccw")
+
+        self.assertEqual(repaired.dtype, np.float32)
+        self.assertTrue(np.all(np.diff(repaired) > 0), "must be strictly increasing")
+        # CCW relative angles must be strictly increasing per the model contract.
+        rel = data_util.relative_angle(repaired[0], repaired, "ccw")
+        self.assertEqual(float(rel.relative_angle_rad[0]), 0.0)
+        self.assertTrue(np.all(np.diff(rel.relative_angle_rad) > 0))
+        self.assertTrue(np.all(~rel.wrap_around_flag))
+
+    def test_enforce_spinning_monotonic_rejects_invalid_direction(self) -> None:
+        """An unknown spinning direction raises ValueError."""
+        az = -np.arange(8, dtype=np.float64) * (2 * np.pi / 8)
+        with self.assertRaises(ValueError):
+            enforce_spinning_monotonic(az, 8, cast(Literal["cw", "ccw"], "sideways"))
+
+    # --- derive_model_from_decompensated tests ---------------------------------
+
+    def _make_decompensated_grid(self, column_azimuths: np.ndarray, n_beams: int) -> np.ndarray:
+        """Build a synthetic decompensated point cloud [n_cols*n_beams, 3].
+
+        All beams in a column share the column azimuth; rows get distinct
+        elevations. Reshaped as [n_cols, n_beams, 3] by the estimator.
+        """
+        n_cols = len(column_azimuths)
+        elevations = np.linspace(np.radians(-30.0), np.radians(10.0), n_beams)
+        distance = 30.0  # far-range valid returns
+        xyz = np.zeros((n_cols, n_beams, 3), dtype=np.float64)
+        for c in range(n_cols):
+            az = column_azimuths[c]
+            for r in range(n_beams):
+                el = elevations[r]
+                cos_el = np.cos(el)
+                xyz[c, r, 0] = distance * cos_el * np.cos(az)
+                xyz[c, r, 1] = distance * cos_el * np.sin(az)
+                xyz[c, r, 2] = distance * np.sin(el)
+        return xyz.reshape(n_cols * n_beams, 3)
+
+    def test_derive_model_from_decompensated_near_degenerate(self) -> None:
+        """Near-degenerate adjacent azimuths must not break model construction.
+
+        Reproduces the scene-0007 failure: real per-column azimuths are not
+        perfectly uniform, so adjacent columns can become equal (or invert)
+        after the float32 cast, tripping the ncore strict-monotonicity assert.
+        The fix repairs these so the model constructs successfully.
+        """
+        n_cols = HDL32E_N_COLUMNS
+        n_beams = HDL32E_N_BEAMS
+
+        # Uniform CW decreasing azimuths with a couple of near-degenerate pairs:
+        # one sub-float32-eps step and one tiny local inversion.
+        az = -np.arange(n_cols, dtype=np.float64) * (2 * np.pi / n_cols)
+        az[400] = az[399] - 1e-9  # collapses to equal after float32 cast
+        az[800], az[801] = az[801], az[800]  # local inversion
+
+        xyz = self._make_decompensated_grid(az, n_beams)
+
+        model = derive_model_from_decompensated(
+            xyz_decompensated=xyz,
+            n_beams_per_column=n_beams,
+            n_target_cols=n_cols,
+            spinning_direction="cw",
+            spinning_frequency_hz=20.0,
+        )
+
+        assert model is not None
+        # The model constructor already enforces strict monotonicity; verify it
+        # explicitly so this test documents the invariant.
+        col_az = model.column_azimuths_rad
+        rel = data_util.relative_angle(col_az[0], col_az, "cw")
+        self.assertTrue(np.all(np.diff(rel.relative_angle_rad) > 0))
+
+    def test_derive_model_from_decompensated_rejects_per_beam_outliers(self) -> None:
+        """Per-beam azimuth outliers must not corrupt the column azimuths.
+
+        The per-column azimuth is the circular median across all valid rows, so a
+        few rows carrying spurious returns (wrong object, multipath) in each
+        column are rejected. A single reference row would instead let those
+        outliers reorder columns. The recovered azimuths must match the true
+        per-column sweep and be strictly monotonic.
+        """
+        n_cols = HDL32E_N_COLUMNS
+        n_beams = HDL32E_N_BEAMS
+
+        true_az = -np.arange(n_cols, dtype=np.float64) * (2 * np.pi / n_cols)
+        xyz = self._make_decompensated_grid(true_az, n_beams).reshape(n_cols, n_beams, 3)
+
+        # Corrupt a few beams per column with a large azimuth offset (gross
+        # outliers), but keep the majority of rows clean so the median survives.
+        rng = np.random.default_rng(0)
+        distance = 30.0
+        for c in range(n_cols):
+            bad_rows = rng.choice(n_beams, size=3, replace=False)
+            for r in bad_rows:
+                bad_az = true_az[c] + rng.uniform(1.0, 3.0)  # ~60-170 deg off
+                xyz[c, r, 0] = distance * np.cos(bad_az)
+                xyz[c, r, 1] = distance * np.sin(bad_az)
+                xyz[c, r, 2] = 0.0
+        xyz = xyz.reshape(n_cols * n_beams, 3)
+
+        model = derive_model_from_decompensated(
+            xyz_decompensated=xyz,
+            n_beams_per_column=n_beams,
+            n_target_cols=n_cols,
+            spinning_direction="cw",
+            spinning_frequency_hz=20.0,
+        )
+
+        assert model is not None
+        col_az = model.column_azimuths_rad
+        # Strictly monotonic.
+        rel = data_util.relative_angle(col_az[0], col_az, "cw")
+        self.assertTrue(np.all(np.diff(rel.relative_angle_rad) > 0))
+        # And close to the true sweep (outliers rejected), allowing a constant
+        # global offset (the model frame is defined up to a rotation).
+        recovered = np.unwrap(col_az.astype(np.float64))
+        truth = np.unwrap(true_az)
+        residual = (recovered - truth) - np.median(recovered - truth)
+        self.assertLess(float(np.abs(residual).max()), np.radians(1.0))
 
     # --- derive_nominal_hdl32e tests -------------------------------------------
 

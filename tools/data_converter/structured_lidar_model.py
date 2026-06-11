@@ -25,6 +25,7 @@ Low-level composable steps:
     - compute_column_alignment: brute-force integer shift search
     - assign_model_columns: per-column fine refinement at model resolution
     - compute_frame_timestamps: linear timestamp interpolation from column position
+    - enforce_spinning_monotonic: strictly-monotonic column azimuths in the spin direction
     - upsample_model: interpolate column azimuths to higher resolution
     - optimize_model: multi-frame median correction of azimuths and offsets
     - compute_model_consistency: angular error metrics
@@ -81,6 +82,53 @@ class AlignedFrameData:
 
 
 # --- Internal helpers ----------------------------------------------------------
+
+
+def _smooth_sparse_correction(values: np.ndarray, valid: np.ndarray, window: int = 17) -> np.ndarray:
+    """Turn a sparse, noisy per-column correction into a smooth dense one.
+
+    The per-column azimuth correction is only defined where enough points were
+    observed; elsewhere it is absent. Applied as-is (absent columns left at 0,
+    observed columns each shifted by their own noisy median) it reorders
+    neighbouring columns, because the median residual carries high-frequency
+    noise from sparse, uneven point-to-column assignment -- worse on an upsampled
+    grid where adjacent columns sample different point subsets.
+
+    The true per-column offset of a mechanical spin varies smoothly, so we:
+      1. linearly interpolate the correction across columns that had no estimate
+         (rather than snapping them to 0, which creates steps), then
+      2. apply a short centered moving average to remove the residual
+         high-frequency noise.
+    The result is a smooth correction field for every column, so adding it to a
+    monotonic azimuth ramp keeps the ramp ordered.
+
+    Args:
+        values: Per-column correction, shape [n_columns] (0 where not observed).
+        valid: Boolean mask of columns that had an estimate, shape [n_columns].
+        window: Smoothing window in columns (clamped to odd, <= n_columns).
+
+    Returns:
+        Dense, smoothed per-column correction, shape [n_columns].
+    """
+    n = len(values)
+    if not valid.any():
+        return values
+
+    # 1. Interpolate over unobserved columns from the observed ones.
+    idx = np.arange(n)
+    valid_idx = idx[valid]
+    dense = np.interp(idx, valid_idx, values[valid])
+
+    # 2. Centered moving average to suppress high-frequency assignment noise.
+    w = min(window, n)
+    if w % 2 == 0:
+        w -= 1
+    if w < 3:
+        return dense
+    half = w // 2
+    padded = np.pad(dense, half, mode="edge")
+    kernel = np.ones(w, dtype=np.float64) / w
+    return np.convolve(padded, kernel, mode="valid")
 
 
 def _grouped_median(
@@ -316,6 +364,86 @@ def compute_frame_timestamps(
     return timestamps.astype(np.uint64)
 
 
+def enforce_spinning_monotonic(
+    azimuths_rad: np.ndarray, n_columns: int, spinning_direction: Literal["cw", "ccw"]
+) -> np.ndarray:
+    """Repair sub-column ordering jitter in per-column azimuths.
+
+    The ncore lidar model (RowOffsetStructuredSpinningLidarModelParameters)
+    requires the relative angle between consecutive columns to be strictly
+    positive in the spinning direction (see types.py __post_init__). After a
+    global shift that places element 0 at the extremum, that means the azimuths
+    must be strictly monotonic (decreasing for "cw", increasing for "ccw").
+
+    The estimators (derive / upsample / optimize) produce an essentially correct
+    monotonic sweep, but the optimization step applies independent per-column
+    median corrections that can swap a handful of adjacent columns by a fraction
+    of a column width. This helper nudges only those few out-of-order columns
+    just past their predecessor so the sequence is strictly monotonic; it is not
+    meant to rescue grossly malformed input (a span of ~2*pi or wholesale
+    disorder would indicate an upstream bug and is rejected, not silently
+    reshaped).
+
+    The nudge step is 1% of one nominal column width. That is large enough to
+    survive the float32 cast (~8x the float32 ULP near +/-pi for a 1085-column
+    model) yet tiny enough that, for the handful of real violations, the total
+    span stays well below 2*pi.
+
+    Args:
+        azimuths_rad: Column azimuths in radians (shape [N], float).
+        n_columns: Nominal number of columns (sizes the nudge step).
+        spinning_direction: "cw" (azimuths strictly decreasing) or "ccw"
+            (azimuths strictly increasing).
+
+    Returns:
+        Strictly-monotonic (in the spin direction) column azimuths as a float32
+        array spanning strictly less than 2*pi.
+
+    Raises:
+        ValueError: if spinning_direction is invalid, or if the repaired span
+            reaches a full revolution (indicating malformed input).
+    """
+    if spinning_direction not in ("cw", "ccw"):
+        raise ValueError(f"Invalid spinning direction: {spinning_direction}")
+
+    # Solve everything as the CW (strictly-decreasing) problem. CCW is the exact
+    # mirror image, so negate on the way in and on the way out: negation maps a
+    # strictly-increasing (CCW) sequence to a strictly-decreasing (CW) one and
+    # preserves spans.
+    sign = 1.0 if spinning_direction == "cw" else -1.0
+
+    az = np.unwrap(sign * azimuths_rad.astype(np.float64))
+    # Re-wrap to (-pi, pi].
+    az = ((az + np.pi) % (2 * np.pi)) - np.pi
+    # Global shift so element 0 is the maximum (=> strictly decreasing).
+    az[az > az[0]] -= 2 * np.pi
+
+    n = len(az)
+    if n < 2:
+        return (sign * az).astype(np.float32)
+
+    # Nudge out-of-order columns just past their predecessor. 1% of one column
+    # width is sub-0.003 deg for a 1085-column model and >> the float32 ULP, so
+    # the strict ordering survives the float32 cast.
+    min_step = 2.0 * np.pi / n_columns / 100.0
+    for i in range(1, n):
+        if az[i] > az[i - 1] - min_step:
+            az[i] = az[i - 1] - min_step
+
+    # The model requires a sweep strictly within one revolution. Real estimates
+    # span ~2*pi*(1 - 1/n_columns); reaching 2*pi means the input was malformed
+    # (e.g. an upstream estimation bug), which we surface rather than reshape.
+    span = az[0] - az[-1]
+    if span >= 2.0 * np.pi:
+        raise ValueError(
+            f"Column azimuths span {span:.6f} rad >= 2*pi after monotonicity repair; "
+            "the input azimuth estimate is malformed (expected a single sub-revolution sweep)."
+        )
+
+    # Undo the CCW mirror.
+    return (sign * az).astype(np.float32)
+
+
 def upsample_model(
     model_params: RowOffsetStructuredSpinningLidarModelParameters,
     resolution_factor: int,
@@ -349,16 +477,8 @@ def upsample_model(
         native_unwrapped,
     )
 
-    # Re-wrap to (-pi, pi]
-    upsampled_az = ((upsampled_unwrapped + np.pi) % (2 * np.pi) - np.pi).astype(np.float32)
-
-    # Preserve monotonicity: for CW rotation, force strictly decreasing
-    if model_params.spinning_direction == "cw":
-        upsampled_az[upsampled_az > upsampled_az[0]] -= np.float32(2 * np.pi)
-        # Clamp any remaining adjacent violations
-        for i in range(1, len(upsampled_az)):
-            if upsampled_az[i] >= upsampled_az[i - 1]:
-                upsampled_az[i] = upsampled_az[i - 1] - np.float32(1e-7)
+    # Preserve strict monotonicity in the spin direction after interpolation.
+    upsampled_az = enforce_spinning_monotonic(upsampled_unwrapped, n_upsampled, model_params.spinning_direction)
 
     return RowOffsetStructuredSpinningLidarModelParameters(
         spinning_frequency_hz=model_params.spinning_frequency_hz,
@@ -432,11 +552,37 @@ def optimize_model(
         return model_params
 
     for _ in range(n_iterations):
-        # Per-column correction
+        # Per-column correction.
+        #
+        # The correction is split into a global component (applied to every
+        # column) and a per-column local deviation (applied only to columns with
+        # enough observations). This matters for high-resolution (upsampled)
+        # models where the observed sweeps cover only a fraction of the columns:
+        # if the model has a systematic phase offset relative to the data (e.g.
+        # ~pi for some scenes), the naive per-column update shifts only the
+        # observed columns and leaves the unobserved ones behind, tearing the
+        # azimuth ramp apart (span > 2*pi, non-monotonic) and producing a model
+        # that no longer reconstructs the point cloud. Removing the global offset
+        # from all columns first keeps the ramp consistent; the local residual
+        # then refines the columns we actually observed.
         predicted = column_azimuths[cat_cols] + row_offsets[cat_rows]
         residual = np.arctan2(np.sin(cat_azimuths - predicted), np.cos(cat_azimuths - predicted))
-        col_correction = _grouped_median(residual, cat_cols, n_columns, min_count=3)
-        column_azimuths += col_correction
+
+        # Global offset: circular mean of all residuals (robust to wrap).
+        global_correction = float(np.arctan2(np.sin(residual).mean(), np.cos(residual).mean()))
+        # Local per-column deviation from the global offset, only where observed.
+        local_residual = np.arctan2(np.sin(residual - global_correction), np.cos(residual - global_correction))
+        col_counts = np.bincount(cat_cols, minlength=n_columns)
+        observed_cols = col_counts >= 3
+        local_correction = _grouped_median(local_residual, cat_cols, n_columns, min_count=3)
+
+        # Turn the sparse, noisy per-column correction into a smooth dense field
+        # (interpolate over unobserved columns, then suppress high-frequency
+        # assignment noise). Adding a smooth correction to a monotonic azimuth
+        # ramp keeps it ordered, so optimization no longer reorders columns.
+        local_correction = _smooth_sparse_correction(local_correction, observed_cols)
+
+        column_azimuths += global_correction + local_correction
 
         # Per-row correction
         predicted = column_azimuths[cat_cols] + row_offsets[cat_rows]
@@ -444,18 +590,9 @@ def optimize_model(
         row_correction = _grouped_median(residual, cat_rows, n_rows, min_count=3)
         row_offsets += row_correction
 
-    # Monotonicity enforcement for CW rotation: after per-column corrections,
-    # adjacent columns may swap order. Clamp violations using a minimum step
-    # of 1% of one column width (physically: ~0.003 deg for 1085-col model).
-    if model_params.spinning_direction == "cw":
-        min_step = 2.0 * np.pi / n_columns / 100.0
-        column_azimuths_unwrapped = np.unwrap(column_azimuths)
-        column_azimuths = ((column_azimuths_unwrapped + np.pi) % (2 * np.pi)) - np.pi
-        column_azimuths[column_azimuths > column_azimuths[0]] -= 2 * np.pi
-        for i in range(1, len(column_azimuths)):
-            if column_azimuths[i] >= column_azimuths[i - 1]:
-                column_azimuths[i] = column_azimuths[i - 1] - min_step
-
+    # The smoothed per-column correction added to an already-monotonic ramp keeps
+    # the azimuths strictly monotonic, so no post-hoc monotonicity repair is needed
+    # here -- the model constructor validates the invariant.
     return RowOffsetStructuredSpinningLidarModelParameters(
         spinning_frequency_hz=model_params.spinning_frequency_hz,
         spinning_direction=model_params.spinning_direction,
@@ -771,7 +908,7 @@ def derive_model_from_decompensated(
     """Derive a structured lidar model empirically from a decompensated point cloud.
 
     Extracts model parameters from a single decompensated frame:
-    - column_azimuths: from a reference row's per-column azimuths
+    - column_azimuths: per-column circular median azimuth across all valid rows
     - row_azimuth_offsets: measured per-row offsets, blended with analytical
       firing offsets for rows with insufficient far-range observations
     - row_elevations: median elevation per row across all valid columns
@@ -813,24 +950,39 @@ def derive_model_from_decompensated(
     # Valid mask: exclude "no return" sentinel points
     valid_grid = dist_grid > min_valid_distance_m
 
-    # Reference row: the one with the most valid returns across all columns
-    row_valid_count = valid_grid.sum(axis=0)
-    ref_row = int(np.argmax(row_valid_count))
-
-    # column_azimuths: reference row's per-column azimuths (monotonic after decompensation)
-    ref_valid = valid_grid[:, ref_row]
-    if ref_valid.sum() < n_cols * 0.9:
+    # Require enough columns with at least one valid return to estimate azimuths.
+    col_has_return = valid_grid.any(axis=1)
+    if col_has_return.sum() < n_cols * 0.9:
         return None
 
-    col_az = az_grid[:, ref_row].astype(np.float64)
-    if not ref_valid.all():
-        valid_indices = np.where(ref_valid)[0]
-        valid_az_unwrapped = np.unwrap(col_az[ref_valid])
+    # Per-column azimuth as the circular median over all valid rows in the column.
+    # Every beam in a column fires at nearly the same azimuth (they differ only by
+    # the small per-row firing offset), so aggregating across rows averages out
+    # per-beam measurement noise and rejects gross outliers (spurious returns).
+    # A single reference row, by contrast, is fragile: a few bad returns in that
+    # row produce large azimuth jumps that reorder columns. The median across rows
+    # yields a clean, already-monotonic per-column azimuth estimate.
+    col_az = np.full(n_cols, np.nan, dtype=np.float64)
+    for c in range(n_cols):
+        rows_valid = valid_grid[c, :]
+        if rows_valid.any():
+            a = az_grid[c, rows_valid]
+            col_az[c] = np.arctan2(np.median(np.sin(a)), np.median(np.cos(a)))
+
+    # Interpolate any columns that had no valid return at all.
+    col_has_az = ~np.isnan(col_az)
+    if not col_has_az.all():
+        valid_indices = np.where(col_has_az)[0]
+        valid_az_unwrapped = np.unwrap(col_az[col_has_az])
         col_az = np.interp(np.arange(n_cols, dtype=np.float64), valid_indices, valid_az_unwrapped)
 
-    column_azimuths_rad = col_az.astype(np.float32)
-    # Normalize: force strictly decreasing for CW
-    column_azimuths_rad[column_azimuths_rad > column_azimuths_rad[0]] -= np.float32(2 * np.pi)
+    # Enforce strict monotonicity in the spin direction. The raw per-column
+    # estimate is not perfectly uniform, so after the float32 cast adjacent
+    # columns can be equal (diff == 0) or slightly out of order, which trips the
+    # strict-monotonicity assertion in the ncore model constructor.
+    # enforce_spinning_monotonic repairs such near-degenerate pairs and returns
+    # float32.
+    column_azimuths_rad = enforce_spinning_monotonic(col_az, n_cols, spinning_direction)
 
     # Per-row azimuth offsets: measure each row's offset from the column azimuths
     center_col = n_cols // 2
